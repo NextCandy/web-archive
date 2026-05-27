@@ -1,12 +1,11 @@
 type ZipEntryInput = {
   name: string
-  data: ArrayBuffer | Uint8Array | string
+  data: ArrayBuffer | Uint8Array | ReadableStream<Uint8Array> | string
   modifiedAt?: Date
 }
 
-type PreparedZipEntry = {
+type CentralDirectoryEntry = {
   name: Uint8Array
-  data: Uint8Array
   crc: number
   compressedSize: number
   uncompressedSize: number
@@ -17,6 +16,7 @@ type PreparedZipEntry = {
 
 const encoder = new TextEncoder()
 const crcTable = makeCrcTable()
+const UTF8_AND_DATA_DESCRIPTOR_FLAGS = 0x0808
 
 function makeCrcTable() {
   return Array.from({ length: 256 }, (_, index) => {
@@ -28,12 +28,16 @@ function makeCrcTable() {
   })
 }
 
-function crc32(data: Uint8Array) {
-  let value = 0xFFFFFFFF
+function updateCrc32(crc: number, data: Uint8Array) {
+  let value = crc
   for (const byte of data) {
     value = crcTable[(value ^ byte) & 0xFF] ^ (value >>> 8)
   }
-  return (value ^ 0xFFFFFFFF) >>> 0
+  return value >>> 0
+}
+
+function finishCrc32(crc: number) {
+  return (crc ^ 0xFFFFFFFF) >>> 0
 }
 
 function toUint8Array(data: ArrayBuffer | Uint8Array | string) {
@@ -42,6 +46,27 @@ function toUint8Array(data: ArrayBuffer | Uint8Array | string) {
   if (data instanceof Uint8Array)
     return data
   return new Uint8Array(data)
+}
+
+async function* toChunks(data: ZipEntryInput['data']): AsyncGenerator<Uint8Array> {
+  if (typeof ReadableStream !== 'undefined' && data instanceof ReadableStream) {
+    const reader = data.getReader()
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done)
+          break
+        if (value)
+          yield value
+      }
+    }
+    finally {
+      reader.releaseLock()
+    }
+    return
+  }
+
+  yield toUint8Array(data)
 }
 
 function dosDateTime(date = new Date()) {
@@ -70,30 +95,40 @@ function concat(parts: Uint8Array[]) {
   return output
 }
 
-function makeLocalHeader(entry: PreparedZipEntry) {
+function makeLocalHeader(entry: Pick<CentralDirectoryEntry, 'modDate' | 'modTime' | 'name'>) {
   const header = new Uint8Array(30)
   const view = new DataView(header.buffer)
   writeUint32(view, 0, 0x04034B50)
   writeUint16(view, 4, 20)
-  writeUint16(view, 6, 0x0800)
+  writeUint16(view, 6, UTF8_AND_DATA_DESCRIPTOR_FLAGS)
   writeUint16(view, 8, 0)
   writeUint16(view, 10, entry.modTime)
   writeUint16(view, 12, entry.modDate)
-  writeUint32(view, 14, entry.crc)
-  writeUint32(view, 18, entry.compressedSize)
-  writeUint32(view, 22, entry.uncompressedSize)
+  writeUint32(view, 14, 0)
+  writeUint32(view, 18, 0)
+  writeUint32(view, 22, 0)
   writeUint16(view, 26, entry.name.length)
   writeUint16(view, 28, 0)
-  return concat([header, entry.name, entry.data])
+  return concat([header, entry.name])
 }
 
-function makeCentralDirectoryHeader(entry: PreparedZipEntry) {
+function makeDataDescriptor(entry: Pick<CentralDirectoryEntry, 'compressedSize' | 'crc' | 'uncompressedSize'>) {
+  const descriptor = new Uint8Array(16)
+  const view = new DataView(descriptor.buffer)
+  writeUint32(view, 0, 0x08074B50)
+  writeUint32(view, 4, entry.crc)
+  writeUint32(view, 8, entry.compressedSize)
+  writeUint32(view, 12, entry.uncompressedSize)
+  return descriptor
+}
+
+function makeCentralDirectoryHeader(entry: CentralDirectoryEntry) {
   const header = new Uint8Array(46)
   const view = new DataView(header.buffer)
   writeUint32(view, 0, 0x02014B50)
   writeUint16(view, 4, 20)
   writeUint16(view, 6, 20)
-  writeUint16(view, 8, 0x0800)
+  writeUint16(view, 8, UTF8_AND_DATA_DESCRIPTOR_FLAGS)
   writeUint16(view, 10, 0)
   writeUint16(view, 12, entry.modTime)
   writeUint16(view, 14, entry.modDate)
@@ -124,35 +159,55 @@ function makeEndOfCentralDirectory(entryCount: number, centralDirectorySize: num
   return header
 }
 
-function createZip(entries: ZipEntryInput[]) {
-  let offset = 0
-  const preparedEntries = entries.map((entry) => {
-    const data = toUint8Array(entry.data)
-    const { modTime, modDate } = dosDateTime(entry.modifiedAt)
-    const preparedEntry = {
-      name: encoder.encode(entry.name),
-      data,
-      crc: crc32(data),
-      compressedSize: data.length,
-      uncompressedSize: data.length,
-      modTime,
-      modDate,
-      offset,
-    }
-    offset += 30 + preparedEntry.name.length + data.length
-    return preparedEntry
+function createZipStream(entries: AsyncIterable<ZipEntryInput> | Iterable<ZipEntryInput>) {
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const centralDirectoryEntries: CentralDirectoryEntry[] = []
+      let offset = 0
+
+      for await (const entry of entries) {
+        const name = encoder.encode(entry.name)
+        const { modTime, modDate } = dosDateTime(entry.modifiedAt)
+        const localOffset = offset
+        const localHeader = makeLocalHeader({ name, modTime, modDate })
+        controller.enqueue(localHeader)
+        offset += localHeader.length
+
+        let crc = 0xFFFFFFFF
+        let size = 0
+        for await (const chunk of toChunks(entry.data)) {
+          crc = updateCrc32(crc, chunk)
+          size += chunk.length
+          controller.enqueue(chunk)
+          offset += chunk.length
+        }
+
+        const centralDirectoryEntry = {
+          name,
+          crc: finishCrc32(crc),
+          compressedSize: size,
+          uncompressedSize: size,
+          modTime,
+          modDate,
+          offset: localOffset,
+        }
+        const descriptor = makeDataDescriptor(centralDirectoryEntry)
+        controller.enqueue(descriptor)
+        offset += descriptor.length
+        centralDirectoryEntries.push(centralDirectoryEntry)
+      }
+
+      const centralDirectoryOffset = offset
+      const centralDirectory = concat(centralDirectoryEntries.map(makeCentralDirectoryHeader))
+      controller.enqueue(centralDirectory)
+      controller.enqueue(makeEndOfCentralDirectory(
+        centralDirectoryEntries.length,
+        centralDirectory.length,
+        centralDirectoryOffset,
+      ))
+      controller.close()
+    },
   })
-
-  const localParts = preparedEntries.map(makeLocalHeader)
-  const centralDirectoryParts = preparedEntries.map(makeCentralDirectoryHeader)
-  const centralDirectory = concat(centralDirectoryParts)
-  const endOfCentralDirectory = makeEndOfCentralDirectory(
-    preparedEntries.length,
-    centralDirectory.length,
-    offset,
-  )
-
-  return concat([...localParts, centralDirectory, endOfCentralDirectory])
 }
 
-export { createZip }
+export { createZipStream }

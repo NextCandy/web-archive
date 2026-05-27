@@ -9,7 +9,7 @@ import { getFolderById, restoreFolder } from '~/model/folder'
 import { getFileFromBucket, saveFileToBucket } from '~/utils/file'
 import { updateShowcase } from '~/model/showcase'
 import { updateBindPageByTagName } from '~/model/tag'
-import { createZip } from '~/utils/zip'
+import { createZipStream } from '~/utils/zip'
 
 const app = new Hono<HonoTypeUserInformation>()
 
@@ -472,32 +472,27 @@ app.get(
       updatedAt: page.updatedAt,
     }))
 
-    const zipEntries: { name: string, data: string | ArrayBuffer }[] = [
-      {
+    async function* exportEntries() {
+      yield {
         name: 'manifest.json',
         data: JSON.stringify(manifest, null, 2),
-      },
-    ]
-
-    for (const page of pages) {
-      const content = await getFileFromBucket(c.env.BUCKET, page.contentUrl)
-      if (isNil(content)) {
-        console.error(`Export skipped missing content for page ${page.id}`)
-        continue
       }
 
-      zipEntries.push({
-        name: `pages/${page.id}-${safeExportFileName(page.title)}.html`,
-        data: await content.arrayBuffer(),
-      })
+      for (const page of pages) {
+        const content = await getFileFromBucket(c.env.BUCKET, page.contentUrl)
+        if (isNil(content)) {
+          console.error(`Export skipped missing content for page ${page.id}`)
+          continue
+        }
+
+        yield {
+          name: `pages/${page.id}-${safeExportFileName(page.title)}.html`,
+          data: content.body ?? await content.arrayBuffer(),
+        }
+      }
     }
 
-    if (zipEntries.length === 1) {
-      return c.json(result.error(404, 'No page content found to export'))
-    }
-
-    const zipContent = createZip(zipEntries)
-    return new Response(zipContent, {
+    return new Response(createZipStream(exportEntries()), {
       headers: {
         'Content-Type': 'application/zip',
         'Content-Disposition': `attachment; filename="web-archive-export-${Date.now()}.zip"`,
