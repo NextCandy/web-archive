@@ -159,6 +159,10 @@ function makeEndOfCentralDirectory(entryCount: number, centralDirectorySize: num
   return header
 }
 
+function yieldToEventLoop() {
+  return new Promise(resolve => setTimeout(resolve, 0))
+}
+
 function createZipStream(entries: AsyncIterable<ZipEntryInput> | Iterable<ZipEntryInput>) {
   let cancelled = false
 
@@ -178,6 +182,7 @@ function createZipStream(entries: AsyncIterable<ZipEntryInput> | Iterable<ZipEnt
           const localHeader = makeLocalHeader({ name, modTime, modDate })
           controller.enqueue(localHeader)
           offset += localHeader.length
+          await yieldToEventLoop()
 
           let crc = 0xFFFFFFFF
           let size = 0
@@ -189,6 +194,7 @@ function createZipStream(entries: AsyncIterable<ZipEntryInput> | Iterable<ZipEnt
             size += chunk.length
             controller.enqueue(chunk)
             offset += chunk.length
+            await yieldToEventLoop()
           }
 
           const centralDirectoryEntry = {
@@ -204,11 +210,13 @@ function createZipStream(entries: AsyncIterable<ZipEntryInput> | Iterable<ZipEnt
           controller.enqueue(descriptor)
           offset += descriptor.length
           centralDirectoryEntries.push(centralDirectoryEntry)
+          await yieldToEventLoop()
         }
 
         const centralDirectoryOffset = offset
         const centralDirectory = concat(centralDirectoryEntries.map(makeCentralDirectoryHeader))
         controller.enqueue(centralDirectory)
+        await yieldToEventLoop()
         controller.enqueue(makeEndOfCentralDirectory(
           centralDirectoryEntries.length,
           centralDirectory.length,
