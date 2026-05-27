@@ -9,8 +9,20 @@ import { getFolderById, restoreFolder } from '~/model/folder'
 import { getFileFromBucket, saveFileToBucket } from '~/utils/file'
 import { updateShowcase } from '~/model/showcase'
 import { updateBindPageByTagName } from '~/model/tag'
+import { createZip } from '~/utils/zip'
 
 const app = new Hono<HonoTypeUserInformation>()
+
+function safeExportFileName(title: string) {
+  return (title || 'untitled')
+    .split('')
+    .map(char => char.charCodeAt(0) < 32 ? '_' : char)
+    .join('')
+    .replace(/[<>:"/\\|?*]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80) || 'untitled'
+}
 
 app.post(
   '/upload_new_page',
@@ -428,6 +440,70 @@ app.get(
     }
 
     return c.body(await screenshot.arrayBuffer())
+  },
+)
+
+app.get(
+  '/export',
+  validator('query', (value, c) => {
+    if (isNotNil(value.folderId) && !isNumberString(value.folderId)) {
+      return c.json(result.error(400, 'Folder ID should be a number'))
+    }
+
+    return {
+      folderId: isNotNil(value.folderId) ? Number(value.folderId) : undefined,
+    }
+  }),
+  async (c) => {
+    const { folderId } = c.req.valid('query')
+    const pages = await queryPage(c.env.DB, { folderId })
+
+    if (pages.length === 0) {
+      return c.json(result.error(404, 'No pages found to export'))
+    }
+
+    const manifest = pages.map(page => ({
+      id: page.id,
+      title: page.title,
+      pageUrl: page.pageUrl,
+      pageDesc: page.pageDesc,
+      folderId: page.folderId,
+      createdAt: page.createdAt,
+      updatedAt: page.updatedAt,
+    }))
+
+    const zipEntries: { name: string, data: string | ArrayBuffer }[] = [
+      {
+        name: 'manifest.json',
+        data: JSON.stringify(manifest, null, 2),
+      },
+    ]
+
+    for (const page of pages) {
+      const content = await getFileFromBucket(c.env.BUCKET, page.contentUrl)
+      if (isNil(content)) {
+        console.error(`Export skipped missing content for page ${page.id}`)
+        continue
+      }
+
+      zipEntries.push({
+        name: `pages/${page.id}-${safeExportFileName(page.title)}.html`,
+        data: await content.arrayBuffer(),
+      })
+    }
+
+    if (zipEntries.length === 1) {
+      return c.json(result.error(404, 'No page content found to export'))
+    }
+
+    const zipContent = createZip(zipEntries)
+    return new Response(zipContent, {
+      headers: {
+        'Content-Type': 'application/zip',
+        'Content-Disposition': `attachment; filename="web-archive-export-${Date.now()}.zip"`,
+        'Cache-Control': 'no-store',
+      },
+    })
   },
 )
 
