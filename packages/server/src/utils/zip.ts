@@ -160,52 +160,65 @@ function makeEndOfCentralDirectory(entryCount: number, centralDirectorySize: num
 }
 
 function createZipStream(entries: AsyncIterable<ZipEntryInput> | Iterable<ZipEntryInput>) {
+  let cancelled = false
+
   return new ReadableStream<Uint8Array>({
-    async start(controller) {
-      const centralDirectoryEntries: CentralDirectoryEntry[] = []
-      let offset = 0
+    start(controller) {
+      void (async () => {
+        const centralDirectoryEntries: CentralDirectoryEntry[] = []
+        let offset = 0
 
-      for await (const entry of entries) {
-        const name = encoder.encode(entry.name)
-        const { modTime, modDate } = dosDateTime(entry.modifiedAt)
-        const localOffset = offset
-        const localHeader = makeLocalHeader({ name, modTime, modDate })
-        controller.enqueue(localHeader)
-        offset += localHeader.length
+        for await (const entry of entries) {
+          if (cancelled)
+            return
 
-        let crc = 0xFFFFFFFF
-        let size = 0
-        for await (const chunk of toChunks(entry.data)) {
-          crc = updateCrc32(crc, chunk)
-          size += chunk.length
-          controller.enqueue(chunk)
-          offset += chunk.length
+          const name = encoder.encode(entry.name)
+          const { modTime, modDate } = dosDateTime(entry.modifiedAt)
+          const localOffset = offset
+          const localHeader = makeLocalHeader({ name, modTime, modDate })
+          controller.enqueue(localHeader)
+          offset += localHeader.length
+
+          let crc = 0xFFFFFFFF
+          let size = 0
+          for await (const chunk of toChunks(entry.data)) {
+            if (cancelled)
+              return
+
+            crc = updateCrc32(crc, chunk)
+            size += chunk.length
+            controller.enqueue(chunk)
+            offset += chunk.length
+          }
+
+          const centralDirectoryEntry = {
+            name,
+            crc: finishCrc32(crc),
+            compressedSize: size,
+            uncompressedSize: size,
+            modTime,
+            modDate,
+            offset: localOffset,
+          }
+          const descriptor = makeDataDescriptor(centralDirectoryEntry)
+          controller.enqueue(descriptor)
+          offset += descriptor.length
+          centralDirectoryEntries.push(centralDirectoryEntry)
         }
 
-        const centralDirectoryEntry = {
-          name,
-          crc: finishCrc32(crc),
-          compressedSize: size,
-          uncompressedSize: size,
-          modTime,
-          modDate,
-          offset: localOffset,
-        }
-        const descriptor = makeDataDescriptor(centralDirectoryEntry)
-        controller.enqueue(descriptor)
-        offset += descriptor.length
-        centralDirectoryEntries.push(centralDirectoryEntry)
-      }
-
-      const centralDirectoryOffset = offset
-      const centralDirectory = concat(centralDirectoryEntries.map(makeCentralDirectoryHeader))
-      controller.enqueue(centralDirectory)
-      controller.enqueue(makeEndOfCentralDirectory(
-        centralDirectoryEntries.length,
-        centralDirectory.length,
-        centralDirectoryOffset,
-      ))
-      controller.close()
+        const centralDirectoryOffset = offset
+        const centralDirectory = concat(centralDirectoryEntries.map(makeCentralDirectoryHeader))
+        controller.enqueue(centralDirectory)
+        controller.enqueue(makeEndOfCentralDirectory(
+          centralDirectoryEntries.length,
+          centralDirectory.length,
+          centralDirectoryOffset,
+        ))
+        controller.close()
+      })().catch(error => controller.error(error))
+    },
+    cancel() {
+      cancelled = true
     },
   })
 }
